@@ -1,0 +1,136 @@
+name: CI/CD - Build, Test, Scan, Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never run two deployments at the same time.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: employee-api
+  ECS_CLUSTER: employee-cluster
+  ECS_SERVICE: employee-api-service
+  TASK_FAMILY: employee-task
+  CONTAINER_NAME: employee-api
+  ALB_URL: http://emp-alb-820519526.us-east-1.elb.amazonaws.com
+  CLOUDFRONT_URL: https://d1a7kv1va3r66w.cloudfront.net
+
+jobs:
+  build-and-test:
+    name: Build & Unit Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Build (install dependencies)
+        run: npm ci
+
+      - name: Unit test
+        run: npm test
+
+  deploy:
+    name: Docker Build, Scan, Push & Deploy
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # lets the job request a GitHub OIDC token for AWS
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Docker build
+        # Plain single-platform image (no provenance/SBOM index) so ECR can scan it.
+        run: |
+          docker buildx build --provenance=false --sbom=false --load \
+            -t "$ECR_REPOSITORY:${{ github.sha }}" .
+
+      - name: Trivy security scan (fail on fixable HIGH/CRITICAL)
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.58.1 image \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress \
+            "$ECR_REPOSITORY:${{ github.sha }}"
+
+      - name: Configure AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push to ECR
+        id: push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+          docker tag "$ECR_REPOSITORY:${{ github.sha }}" "$IMAGE"
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Get current task definition
+        run: |
+          aws ecs describe-task-definition --task-definition "$TASK_FAMILY" \
+            --query taskDefinition > task-definition.json
+
+      - name: Render new task definition with the new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.push.outputs.image }}
+
+      - name: Deploy to ECS (rolling update)
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+
+      - name: Verify deployment
+        env:
+          API_KEY: ${{ secrets.APPSYNC_API_KEY }}
+          NEW_TASK_DEF: ${{ steps.deploy.outputs.task-definition-arn }}
+        run: |
+          echo "1) Service is running the new task definition"
+          RUNNING=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query "services[0].taskDefinition" --output text)
+          echo "   expected: $NEW_TASK_DEF"
+          echo "   running:  $RUNNING"
+          test "$RUNNING" = "$NEW_TASK_DEF"
+
+          echo "2) ALB health check"
+          curl -fsS "$ALB_URL/health" | tee /dev/stderr | grep -q '"status":"UP"'
+
+          echo "3) End-to-end GraphQL query through CloudFront -> AppSync -> ALB -> ECS -> RDS"
+          curl -fsS -X POST "$CLOUDFRONT_URL/graphql" \
+            -H "Content-Type: application/json" -H "x-api-key: $API_KEY" \
+            -d '{"query":"{ employees { id name } }"}' > graphql.json
+          cat graphql.json; echo
+          grep -q '"employees"' graphql.json
+          if grep -q '"errors"' graphql.json; then
+            echo "GraphQL returned errors"; exit 1
+          fi
+          echo "Deployment verified."

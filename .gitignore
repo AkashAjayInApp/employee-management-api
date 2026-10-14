@@ -1,0 +1,15 @@
+node_modules/
+npm-debug.log*
+
+# Secrets / local env
+.env
+.env.*
+
+# Terraform: state holds resource details and can contain secrets; never commit it.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+crash.log
+.terraform.lock.hcl.bak
