@@ -3,6 +3,10 @@ name: CI/CD - Build, Test, Scan, Deploy to ECS
 on:
   push:
     branches: [main]
+    # Documentation-only changes don't need a build and deployment.
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
   workflow_dispatch:
 
 # Never run two deployments at the same time.
