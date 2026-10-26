@@ -59,6 +59,15 @@ test("POST /employees rejects missing fields", async () => {
     assert.equal(res.status, 400);
 });
 
+test("POST /employees rejects malformed JSON with 400", async () => {
+    const res = await fetch(`${baseUrl}/employees`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{bad json"
+    });
+    assert.equal(res.status, 400);
+});
+
 test("ids are not reused after a delete", async () => {
     const first = await (await request("POST", "/employees", newEmployee)).json();
     assert.equal((await request("DELETE", `/employees/${first.id}`)).status, 204);

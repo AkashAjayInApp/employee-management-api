@@ -91,6 +91,11 @@ function createApp(store) {
 
     // Express 5 forwards errors from async handlers here (e.g. database unreachable).
     app.use((err, req, res, next) => {
+        // Client errors raised by Express itself, e.g. malformed JSON body (400)
+        // or payload too large (413), are the caller's fault, not a server error.
+        if (err.status >= 400 && err.status < 500) {
+            return res.status(err.status).json({ message: "Invalid request body" });
+        }
         console.error(`${req.method} ${req.path} failed:`, err.message);
         res.status(500).json({ message: "Internal server error" });
     });
